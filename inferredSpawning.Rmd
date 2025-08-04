@@ -19,6 +19,7 @@ library(tidyr)
 library(lubridate)
 library(readxl)
 library(patchwork)
+library(scales)
 
 ```
 
@@ -37,52 +38,63 @@ spawn.1clean <- spawn.0raw %>%
 spawn.2sum <- spawn.1clean %>%
   mutate(
     Date = as.Date(Date),
+    Month = month(Date),
     Year = year(Date),
     Species = as.character(Species),
     Eggs = factor(Eggs, levels = c("No", "Immature", "Mature")),
-    DayOfYear = yday(Date),
-    x_numeric = DayOfYear
+    SeasonStartRaw = ifelse(Month >= 7, Year, Year - 1),
+    SeasonStart = ifelse(SeasonStartRaw == 2022, 2023, SeasonStartRaw),
+    SeasonLabel = paste0(SeasonStart, "–", SeasonStart + 1),
+    DayOfSeason = as.integer(Date - as.Date(paste0(SeasonStartRaw, "-07-01"))) + 1,
+    x_numeric = DayOfSeason
   )
 
-# === 2. SUMMARISE BY ACTUAL DATE ===
+# === 2. SUMMARISE BY SEASON-DATE ===
 
 spawn.3pie <- spawn.2sum %>%
-  group_by(Species, Year, Date, Eggs, x_numeric) %>%
+  group_by(Species, SeasonLabel, Date, Eggs, x_numeric) %>%
   summarise(n = n(), .groups = "drop") %>%
-  group_by(Species, Year, Date, x_numeric) %>%
+  group_by(Species, SeasonLabel, Date, x_numeric) %>%
   complete(Eggs = factor(c("No", "Immature", "Mature"),
                          levels = c("No", "Immature", "Mature")),
            fill = list(n = 0)) %>%
   mutate(frac = n / sum(n)) %>%
+  group_by(Species, SeasonLabel, Date) %>%
+  mutate(n_total = sum(n)) %>%
   ungroup()
 
 # === 3. Y-AXIS POSITIONS ===
 
 y_order <- spawn.3pie %>%
-  distinct(Species, Year) %>%
-  arrange(Species, Year) %>%
+  distinct(Species, SeasonLabel) %>%
+  arrange(Species, SeasonLabel) %>%
   mutate(Ypos = row_number())
 
 spawn.3pie <- spawn.3pie %>%
-  left_join(y_order, by = c("Species", "Year"))
+  left_join(y_order, by = c("Species", "SeasonLabel"))
 
 # === 4. BASE PLOT ===
 
 dummy_points <- y_order %>% mutate(x = 0)
 
+month_starts <- seq(as.Date("2000-07-01"), as.Date("2001-06-01"), by = "1 month")
+month_days <- as.integer(month_starts - as.Date("2000-07-01")) + 1
+month_labels <- format(month_starts, "%b")
+
 plot_base <- ggplot() +
   geom_point(data = dummy_points, aes(x = x, y = Ypos), alpha = 0) +
-  scale_x_continuous(
-    name = "Month",
-    breaks = c(1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335),
-    labels = month.abb,
-    expand = expansion(add = 5)
-  ) +
+scale_x_continuous(
+  name = "Month",
+  breaks = month_days,
+  labels = month_labels,
+  limits = c(0, 370),  # full range for July 1 to June 30 (up to leap year safety)
+  expand = c(0, 0)
+)+
   scale_y_continuous(
     breaks = y_order$Ypos,
-    labels = paste(y_order$Species, y_order$Year, sep = " - "),
+    labels = paste(y_order$Species, y_order$SeasonLabel, sep = " - "),
     name = "Species",
-    expand = expansion(add = 1)
+    expand = expansion(add = 10)
   ) +
   theme_minimal() +
   theme(
@@ -105,76 +117,110 @@ make_pie_grob <- function(df_group, show_legend = FALSE) {
     theme(legend.position = if (show_legend) "right" else "none")
 }
 
+radius_scale <- function(n) {
+  rescale(n, to = c(2, 7), from = range(spawn.3pie$n_total, na.rm = TRUE))
+}
+
 # === 6. DRAW PIE CHARTS ===
 
 group_ids <- spawn.3pie %>%
-  group_by(Species, Year, Date) %>%
-  filter(n() == 3) %>%
-  ungroup() %>%
-  distinct(Species, Year, Date, x_numeric)
+  group_by(Species, SeasonLabel, Date) %>%
+  summarise(n_rows = n(), x_numeric = first(x_numeric), Ypos = first(Ypos),
+            n_total = first(n_total), .groups = "drop") %>%
+  filter(n_rows == 3)
+
+# Collect grobs
+pie_grobs <- vector("list", length = nrow(group_ids))
 
 for (i in seq_len(nrow(group_ids))) {
   group_data <- spawn.3pie %>%
     filter(Species == group_ids$Species[i],
-           Year == group_ids$Year[i],
+           SeasonLabel == group_ids$SeasonLabel[i],
            Date == group_ids$Date[i])
-  
-  if (nrow(group_data) == 3) {
-    grob <- ggplotGrob(make_pie_grob(group_data))
-    xpos <- group_data$x_numeric[1]
-    ypos <- group_data$Ypos[1]
-    
-    plot_base <- plot_base +
-      annotation_custom(
-        grob,
-        xmin = xpos - 5, xmax = xpos + 5,
-        ymin = ypos - 0.4, ymax = ypos + 0.4
-      )
-  }
+
+  grob <- ggplotGrob(make_pie_grob(group_data))
+  xpos <- group_ids$x_numeric[i]
+  ypos <- group_ids$Ypos[i]
+  radius <- radius_scale(group_ids$n_total[i])
+
+  pie_grobs[[i]] <- annotation_custom(
+    grob,
+    xmin = xpos - radius, xmax = xpos + radius,
+    ymin = ypos - radius * 0.1, ymax = ypos + radius * 0.1
+  )
 }
 
-# === 7. FULL MOON ICONS ===
+# Add grobs to plot
+for (grob_obj in pie_grobs) {
+  plot_base <- plot_base + grob_obj
+}
 
-full_moons <- tibble(
-  Date = as.Date(c(
-    "2022-01-17", "2022-02-16", "2022-03-18", "2022-04-16",
-    "2022-05-16", "2022-06-14", "2022-07-13", "2022-08-11",
-    "2022-09-10", "2022-10-09", "2022-11-08", "2022-12-08"
-  )),
-  Label = "🌕"
-) %>%
-  mutate(x_numeric = yday(Date))
 
-plot_base <- plot_base +
-  geom_text(
-    data = full_moons,
-    aes(x = x_numeric, y = min(y_order$Ypos) - 1, label = Label),
-    size = 5
-  )
-
-# === 8. LEGEND PLOT ===
+# === 7. LEGENDS ===
 
 legend_data <- tibble(
   Eggs = factor(c("No", "Immature", "Mature"),
                 levels = c("No", "Immature", "Mature")),
-  frac = c(1, 1, 1) / 3
+  frac = c(1/3, 1/3, 1/3)
 )
 
-legend_plot <- make_pie_grob(legend_data, show_legend = TRUE)
+egg_legend <- ggplot(legend_data, aes(x = "", y = frac, fill = Eggs)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  scale_fill_manual(values = c("gray70", "orange", "red"), name = "Egg status") +
+  theme_void() +
+  theme(legend.position = "right")
 
-# === 9. COMBINE AND SAVE ===
+n_range <- range(spawn.3pie$n_total, na.rm = TRUE)
+n_small <- n_range[1]
+n_large <- n_range[2]
 
-combined_plot <- plot_base + legend_plot + plot_layout(widths = c(5, 1))
+make_scaled_pie_grob <- function(n_val) {
+  df <- tibble(
+    Eggs = factor(c("No", "Immature", "Mature"), levels = c("No", "Immature", "Mature")),
+    frac = c(1/3, 1/3, 1/3),
+    n_total = n_val
+  )
+  ggplotGrob(make_pie_grob(df))
+}
+
+grob_small <- make_scaled_pie_grob(n_small)
+grob_large <- make_scaled_pie_grob(n_large)
+
+size_legend_base <- ggplot() +
+  xlim(0, 20) + ylim(0, 20) +
+  theme_void() +
+  annotate("text", x = 10, y = 19, label = "Sampling effort", size = 4)
+
+r_small <- radius_scale(n_small)
+r_large <- radius_scale(n_large)
+
+size_legend_base <- size_legend_base +
+  annotation_custom(grob_large,
+                    xmin = 9 - r_large, xmax = 9 + r_large,
+                    ymin = 15 - r_large * 0.1, ymax = 15 + r_large * 0.1) +
+  annotate("text", x = 11 + r_large, y = 15, label = paste0("n = ", n_large), hjust = 0, size = 3) +
+  annotation_custom(grob_small,
+                    xmin = 9 - r_small, xmax = 9 + r_small,
+                    ymin = 11 - r_small * 0.1, ymax = 11 + r_small * 0.1) +
+  annotate("text", x = 11 + r_small, y = 11, label = paste0("n = ", n_small), hjust = 0, size = 3)
+
+legend_stack <- egg_legend / size_legend_base +
+  plot_layout(heights = c(1, 1.5))
+
+# === 8. COMBINE AND SAVE ===
+
+combined_plot <- plot_base + legend_stack + plot_layout(widths = c(5, 1.5))
 
 print(combined_plot)
 
-ggsave("inferredSpawning_Species x Date x Year x Eggs_withLegend.tiff",
+ggsave("inferredSpawning_Species x Season x Eggs_scaledBySample_legendRight.tiff",
        plot = combined_plot,
        width = 35, height = 21, units = "cm", dpi = 600, compression = "lzw")
 
-
-
-
+ggsave("debug_plot.png", plot = plot_base, width = 10, height = 10)
 
 ```
+
+
 
