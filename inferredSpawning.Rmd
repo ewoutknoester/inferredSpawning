@@ -12,139 +12,505 @@ rm(list=ls()) # Clear workspace
 knitr::opts_knit$set(root.dir = '/tmp') #Set directory at current directory for all subsequent chunks
 options(scipen = 99) # Have all numbers in non-scientific notation
 
-library(cowplot)
-library(ggplot2)
-library(grid)
+library(readxl)
 library(dplyr)
 library(tidyr)
-library(lubridate)
-library(readxl)
-library(patchwork)
-library(scales)
 library(stringr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(cowplot)
+library(patchwork)
+library(grid)
+library(plotly)
+library(htmlwidgets)
+library(ggtext)
 
 ```
 
 # Load data
-```{r data load}
+```{r dataload}
 
 # === 1. LOAD AND CLEAN DATA ===
 
-# Load data
-spawn.0raw <- as.data.frame(read_excel("Spawning database_2025-08.xlsx"))
+spawn.0raw <- as.data.frame(read_excel("Spawning database_2026-06.xlsx")) # Load in Excel
+spawn.0raw <- spawn.0raw |>  dplyr::filter(!is.na(Date)) # Remove empty rows
 
-# Define two remaining species IDs based on descriptions
-spawn.0raw <- spawn.0raw %>%
-  mutate(Species = case_when(
-    str_detect(Species.description, "(?i)A\\. secale|A\\. squarrosa|A\\. variabilis") ~ "Acropora polystoma",
-    str_detect(Species.description, "(?i)A\\. valida|A\\. ocellata") ~ "Acropora natalensis",
-    str_detect(Species, "(?i)Acropora sp\\. \\(corymbose yellow smooth\\)") ~ "Acropora polystoma",
-    str_detect(Species, "(?i)Acropora sp\\. \\(corymbose normal smooth\\)|Acropora cf\\. natalensis") ~ "Acropora natalensis",
-     Species %in% c("Acropora verweyi", "Acropora tenuis", "Acropora polystoma", "Acropora natalensis",
-                    "Acropora latistella", "Acropora humilis", "Acropora gemmifera", "Acropora formosa", "") ~ Species,
-    TRUE ~ "Acropora spp."
-  ))
-
+# Pool multiple branches into single colony row, following logic: Mature > Immature > No
 spawn.1clean <- spawn.0raw %>%
-  select(Date, Reef.type, Species, Species.description, Eggs, Comments) %>%
-  filter(Eggs %in% c("No", "Immature", "Mature")) %>%
-  filter(!is.na(Species), !is.na(Eggs), !is.na(Date))
+  dplyr::filter(Eggs %in% c("No", "Immature", "Mature")) %>%
+  dplyr::arrange(ID.obs) %>%
+  dplyr::mutate(
+    colony_key = paste(
+      Date, Observer, Species, Species.description, Depth_m, Colony.size_cm,
+      sep = " | "
+    ),
+    ApproxColonyID = cumsum(
+      colony_key != dplyr::lag(colony_key, default = dplyr::first(colony_key))
+    ) + 1L
+  ) %>%
+  dplyr::group_by(ApproxColonyID) %>%
+  dplyr::summarise(
+    dplyr::across(-Eggs, dplyr::first),
+    Branches_pooled = dplyr::n(),
+    Eggs = dplyr::case_when(
+      any(Eggs == "Mature") ~ "Mature",
+      any(Eggs == "Immature") ~ "Immature",
+      TRUE ~ "No"
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Eggs = factor(Eggs, levels = c("No", "Immature", "Mature"))
+  ) %>%
+  dplyr::select(
+    Date,
+    Reef.type,
+    Species,
+    Species.description,
+    Colony.size_cm,
+    Eggs,
+    Comments,
+    ApproxColonyID,
+    Branches_pooled
+  )
 
+```
+
+
+# Explore species naming
+```{r taxonomy, eval=FALSE}
+
+# Compare species names by different observers
+
+spawn.check <- spawn.1clean %>%
+  dplyr::mutate(
+    Species = stringr::str_squish(as.character(Species)),
+    Species.description = stringr::str_squish(as.character(Species.description))
+  ) %>%
+  dplyr::filter(
+    !is.na(Species),
+    !is.na(Species.description)
+  )
+
+all_species <- sort(unique(c(spawn.check$Species, spawn.check$Species.description)))
+
+match_tab <- spawn.check %>%
+  dplyr::mutate(
+    Species = factor(Species, levels = all_species),
+    Species.description = factor(Species.description, levels = all_species)
+  ) %>%
+  dplyr::count(Species, Species.description, name = "n") %>%
+  tidyr::complete(
+    Species,
+    Species.description,
+    fill = list(n = 0)
+  ) %>%
+  dplyr::group_by(Species) %>%
+  dplyr::mutate(
+    row_total = sum(n),
+    pct = dplyr::if_else(row_total > 0, 100 * n / row_total, 0),
+    hover_text = paste0(
+      "Species: ", Species,
+      "<br>Species.description: ", Species.description,
+      "<br>n: ", n,
+      "<br>% within Species: ", round(pct, 1), "%"
+    )
+  ) %>%
+  dplyr::ungroup()
+
+p <- ggplot(
+  match_tab,
+  aes(
+    x = Species.description,
+    y = Species,
+    fill = pct,
+    text = hover_text
+  )
+) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    low = "white",
+    high = "steelblue",
+    limits = c(0, 100),
+    na.value = "white",
+    name = "% within\nSpecies"
+  ) +
+  coord_equal() +
+  labs(
+    x = "Species.description",
+    y = "Species",
+    title = "Match between Species and Species.description"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+plotly::ggplotly(p, tooltip = "text")
+
+p_interactive <- plotly::ggplotly(p, tooltip = "text")
+
+htmlwidgets::saveWidget(
+  p_interactive,
+  file = "species_match_heatmap.html",
+  selfcontained = TRUE
+)
+
+```
+
+```{r cleanup}
+
+# Select only colonies >15 cm max diameter
+spawn.1clean <- spawn.1clean %>%  dplyr::filter(Colony.size_cm >= 15)
+
+# Rename / re-identify target species based on keyword matching
+spawn.1clean <- spawn.1clean %>%
+  dplyr::mutate(
+    Species = dplyr::case_when(
+      is.na(Species) ~ Species,
+      stringr::str_detect(Species, stringr::regex("divaricata|natalensis", ignore_case = TRUE)) ~ "A. divaricata",
+      stringr::str_detect(Species, stringr::regex("polystoma",  ignore_case = TRUE)) ~ "A. secale",
+      stringr::str_detect(Species, stringr::regex("formosa",    ignore_case = TRUE)) ~ "A. intermedia",
+      stringr::str_detect(Species, stringr::regex("gemmifera",  ignore_case = TRUE)) ~ "A. gemmifera",
+      stringr::str_detect(Species, stringr::regex("latistella", ignore_case = TRUE)) ~ "A. selago",
+      stringr::str_detect(Species, stringr::regex("tenuis",     ignore_case = TRUE)) ~ "A. tenuis",
+      stringr::str_detect(Species, stringr::regex("verweyi",    ignore_case = TRUE)) ~ "A. austera",
+      TRUE ~ Species
+    )
+  )
+
+# Set unidentified species to A. spp., then pool anything with < 30 observations
+spawn.1clean <- spawn.1clean %>%
+  dplyr::mutate(
+    Species = dplyr::if_else(
+      !is.na(Species) &
+        stringr::str_detect(Species, stringr::fixed("Acropora sp.")),
+      "A. spp.",
+      Species
+    )
+  ) %>%
+  dplyr::add_count(Species, name = "Species_n") %>%
+  dplyr::mutate(
+    Species = dplyr::if_else(
+      !is.na(Species) &
+        Species_n < 30 &
+        stringr::str_detect(Species, stringr::regex("^A(cropora)?\\b", ignore_case = TRUE)),
+      "A. spp.",
+      Species
+    )
+  ) %>%
+  dplyr::select(-Species_n)
+
+# Correct date typo
+spawn.1clean <- spawn.1clean %>%  dplyr::mutate(
+    Date = dplyr::if_else(
+      as.Date(Date) == as.Date("2023-12-27") & Species == "A. selago",
+      Date + lubridate::years(1), Date))
+
+# Sort A. spp. to the end
+spawn.1clean$Species <- factor(spawn.1clean$Species,
+                               levels = c(setdiff(sort(unique(spawn.1clean$Species)), "A. spp."), "A. spp."))
+
+# Select relevant columns
+spawn.1clean <- spawn.1clean %>%
+  dplyr::select(Date, Reef.type, Species, Species.description, Eggs, Comments) %>%
+  dplyr::filter(Eggs %in% c("No", "Immature", "Mature"))
+
+# Shared egg-status colours
+egg_cols <- c(
+  "No" = "gray70",
+  "Immature" = "orange",
+  "Mature" = "red"
+)
+
+# Set data types; set season to start from July
 spawn.2sum <- spawn.1clean %>%
-  mutate(
+  dplyr::mutate(
     Date = as.Date(Date),
-    Month = month(Date),
-    Year = year(Date),
-    Species = as.character(Species),
+    Month = lubridate::month(Date),
+    Year = lubridate::year(Date),
     Eggs = factor(Eggs, levels = c("No", "Immature", "Mature")),
-    SeasonStartRaw = ifelse(Month >= 7, Year, Year - 1),
-    SeasonStart = ifelse(SeasonStartRaw <= 2022, 2023, SeasonStartRaw),
+    SeasonStartRaw = dplyr::if_else(Month >= 7, Year, Year - 1L),
+    SeasonStart = dplyr::if_else(SeasonStartRaw <= 2022, 2023L, SeasonStartRaw),
     SeasonLabel = paste0(SeasonStart, "–", SeasonStart + 1),
     DayOfSeason = as.integer(Date - as.Date(paste0(SeasonStartRaw, "-07-01"))) + 1,
     x_numeric = DayOfSeason
   )
 
-# 1. Sort by species and date, then create groups based on gaps > 3 days
-merged_dates <- spawn.2sum %>%
-  arrange(Species, SeasonLabel, Date) %>%
-  group_by(Species, SeasonLabel) %>%
-  mutate(DateDiff = as.numeric(Date - lag(Date, default = first(Date)))) %>%
-  mutate(DateGroup = cumsum(if_else(DateDiff > 5, 1, 0))) %>%
-  group_by(Species, SeasonLabel, DateGroup) %>%
-  mutate(MergedDate = as.Date(round(mean(as.numeric(Date)), 0), origin = "1970-01-01")) %>%
-  ungroup()
 
-# 2. Replace original Date with merged date, and recompute all dependent fields
+# === 1b. MERGE CLOSE SAMPLING DATES ===
+
+merged_dates <- spawn.2sum %>%
+  dplyr::arrange(Species, SeasonLabel, Date) %>%
+  dplyr::group_by(Species, SeasonLabel) %>%
+  dplyr::mutate(
+    DateDiff = as.numeric(Date - dplyr::lag(Date, default = dplyr::first(Date))),
+    DateGroup = cumsum(dplyr::if_else(DateDiff > 5, 1, 0))
+  ) %>%
+  dplyr::group_by(Species, SeasonLabel, DateGroup) %>%
+  dplyr::mutate(
+    MergedDate = as.Date(
+      round(mean(as.numeric(Date)), 0),
+      origin = "1970-01-01"
+    )
+  ) %>%
+  dplyr::ungroup()
+
 spawn.2sum <- merged_dates %>%
-  mutate(
+  dplyr::mutate(
     Date = MergedDate,
-    Month = month(Date),
-    Year = year(Date),
-    SeasonStartRaw = ifelse(Month >= 7, Year, Year - 1),
-    SeasonStart = ifelse(SeasonStartRaw <= 2022, 2023, SeasonStartRaw),
+    Month = lubridate::month(Date),
+    Year = lubridate::year(Date),
+    SeasonStartRaw = dplyr::if_else(Month >= 7, Year, Year - 1L),
+    SeasonStart = dplyr::if_else(SeasonStartRaw <= 2022, 2023L, SeasonStartRaw),
     SeasonLabel = paste0(SeasonStart, "–", SeasonStart + 1),
     DayOfSeason = as.integer(Date - as.Date(paste0(SeasonStartRaw, "-07-01"))) + 1,
     x_numeric = DayOfSeason
   ) %>%
-  select(-DateDiff, -DateGroup, -MergedDate)
+  dplyr::select(-DateDiff, -DateGroup, -MergedDate)
+
+# Get overage per month (pooled across all years)
+mature_month_pooled <- spawn.2sum %>%
+  dplyr::group_by(Month) %>%
+  dplyr::summarise(
+    n_colonies = dplyr::n(),
+    n_mature = sum(Eggs == "Mature", na.rm = TRUE),
+    perc_mature = mean(Eggs == "Mature", na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(Month)
 
 
-# === 2. SUMMARISE BY SEASON-DATE ===
+
+
+
+# === 2. SUMMARISE BY SPECIES-SEASON-DATE ===
 
 spawn.3pie <- spawn.2sum %>%
-  group_by(Species, SeasonLabel, Date, Eggs, x_numeric) %>%
-  summarise(n = n(), .groups = "drop") %>%
-  group_by(Species, SeasonLabel, Date, x_numeric) %>%
-  complete(Eggs = factor(c("No", "Immature", "Mature"),
-                         levels = c("No", "Immature", "Mature")),
-           fill = list(n = 0)) %>%
-  mutate(frac = n / sum(n)) %>%
-  group_by(Species, SeasonLabel, Date) %>%
-  mutate(n_total = sum(n)) %>%
-  ungroup()
+  dplyr::group_by(Species, SeasonLabel, Date, Eggs, x_numeric) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  dplyr::group_by(Species, SeasonLabel, Date, x_numeric) %>%
+  tidyr::complete(
+    Eggs = factor(
+      c("No", "Immature", "Mature"),
+      levels = c("No", "Immature", "Mature")
+    ),
+    fill = list(n = 0)
+  ) %>%
+  dplyr::mutate(frac = n / sum(n)) %>%
+  dplyr::group_by(Species, SeasonLabel, Date) %>%
+  dplyr::mutate(n_total = sum(n)) %>%
+  dplyr::ungroup()
+
 
 # === 3. Y-AXIS POSITIONS ===
 
+species_levels <- levels(spawn.1clean$Species)   # A. spp. already last
+
 y_order <- spawn.3pie %>%
-  distinct(Species, SeasonLabel) %>%
-  mutate(SortSpecies = if_else(Species == "Acropora spp.", "zzz", Species)) %>%
-  arrange(SortSpecies, SeasonLabel) %>%
-  mutate(Ypos = rev(row_number())) %>%  # reverse the order
-  select(-SortSpecies)
+  dplyr::distinct(Species, SeasonLabel) %>%
+  dplyr::mutate(
+    SpeciesFct = factor(Species, levels = species_levels),
+
+    SpeciesEpithet = stringr::str_replace(Species, "^A\\.\\s+", ""),
+
+    SpeciesShort = dplyr::if_else(
+      Species == "A. spp.",
+      "<i>A.</i> spp.",
+      paste0("<i>A. ", SpeciesEpithet, "</i>")
+    ),
+
+    SeasonShort = stringr::str_replace(
+      SeasonLabel, "20([0-9]{2})[–-]20([0-9]{2})", "\\1-\\2"
+    ),
+
+    YLabel = paste(SpeciesShort, SeasonShort)
+  ) %>%
+  dplyr::arrange(SpeciesFct, SeasonLabel) %>%
+  dplyr::mutate(Ypos = rev(dplyr::row_number())) %>%
+  dplyr::select(-SpeciesFct, -SpeciesEpithet)
 
 spawn.3pie <- spawn.3pie %>%
-  left_join(y_order, by = c("Species", "SeasonLabel"))
+  dplyr::left_join(y_order, by = c("Species", "SeasonLabel"))
+
+# === 3b. FULL MOON DATES ===
+
+full_moons_raw <- tibble::tibble(
+  FullMoonDate = as.Date(c(
+    # 2023–2024 season
+    "2023-07-03",
+    "2023-08-01",
+    "2023-08-31",
+    "2023-09-29",
+    "2023-10-28",
+    "2023-11-27",
+    "2023-12-27",
+    "2024-01-25",
+    "2024-02-24",
+    "2024-03-25",
+    "2024-04-24",
+    "2024-05-23",
+    "2024-06-22",
+
+    # 2024–2025 season
+    "2024-07-21",
+    "2024-08-19",
+    "2024-09-18",
+    "2024-10-17",
+    "2024-11-16",
+    "2024-12-15",
+    "2025-01-14",
+    "2025-02-12",
+    "2025-03-14",
+    "2025-04-13",
+    "2025-05-12",
+    "2025-06-11"
+  ))
+) %>%
+  dplyr::mutate(
+    Month = lubridate::month(FullMoonDate),
+    Year = lubridate::year(FullMoonDate),
+    SeasonStartRaw = dplyr::if_else(Month >= 7, Year, Year - 1L),
+    SeasonStart = dplyr::if_else(SeasonStartRaw <= 2022, 2023L, SeasonStartRaw),
+    SeasonLabel = paste0(SeasonStart, "–", SeasonStart + 1),
+    x_numeric = as.integer(
+      FullMoonDate - as.Date(paste0(SeasonStartRaw, "-07-01"))
+    ) + 1
+  )
+
+full_moon_rows <- y_order %>%
+  dplyr::left_join(full_moons_raw, by = "SeasonLabel") %>%
+  dplyr::filter(!is.na(FullMoonDate))
+
+
+# === 3c. GAUSSIAN-SMOOTHED POOLED EGG-STATUS BAR ===
+
+bottom_y <- min(y_order$Ypos) - 1
+bar_height <- 0.65
+
+# Smoothing strength.
+# Larger = smoother. Try 10, 21, 30, 45, 60.
+smooth_sd_days <- 10
+
+# Circular seasonal distance, so late June and early July are treated as close
+season_dist <- function(a, b) {
+  pmin(abs(a - b), 366 - abs(a - b))
+}
+
+pooled_egg_bar <- tibble::tibble(x_bar = 1:366) %>%
+  tidyr::crossing(
+    Eggs = factor(
+      c("No", "Immature", "Mature"),
+      levels = c("No", "Immature", "Mature")
+    )
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    weighted_n = sum(
+      exp(
+        -0.5 *
+          (season_dist(spawn.2sum$x_numeric, x_bar) / smooth_sd_days)^2
+      ) *
+        (as.character(spawn.2sum$Eggs) == as.character(Eggs)),
+      na.rm = TRUE
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(x_bar, Eggs) %>%
+  dplyr::group_by(x_bar) %>%
+  dplyr::mutate(
+    weighted_total = sum(weighted_n),
+    frac = dplyr::if_else(weighted_total > 0, weighted_n / weighted_total, 0),
+    ymin_frac = dplyr::lag(cumsum(frac), default = 0),
+    ymax_frac = cumsum(frac),
+    xmin = x_bar - 0.5,
+    xmax = x_bar + 0.5,
+    ymin = bottom_y - bar_height / 2 + ymin_frac * bar_height,
+    ymax = bottom_y - bar_height / 2 + ymax_frac * bar_height
+  ) %>%
+  dplyr::ungroup()
+
 
 # === 4. BASE PLOT ===
 
-dummy_points <- y_order %>% mutate(x = 0)
+dummy_points <- y_order %>%
+  dplyr::mutate(x = 0)
 
 month_starts <- seq(as.Date("2000-07-01"), as.Date("2001-06-01"), by = "1 month")
 month_days <- as.integer(month_starts - as.Date("2000-07-01")) + 1
 month_labels <- format(month_starts, "%b")
 
 plot_base <- ggplot() +
-  geom_point(data = dummy_points, aes(x = x, y = Ypos), alpha = 0) +
+
+  # Full moon markers, row-specific
+  geom_segment(
+    data = full_moon_rows,
+    aes(
+      x = x_numeric,
+      xend = x_numeric,
+      y = Ypos - 0.35,
+      yend = Ypos + 0.35
+    ),
+    linewidth = 0.6,
+    linetype = "dotted",
+    colour = "grey45",
+    alpha = 0.9
+  ) +
+
+  # Gaussian-smoothed pooled egg-status bar across all species
+  geom_rect(
+    data = pooled_egg_bar,
+    aes(
+      xmin = xmin,
+      xmax = xmax,
+      ymin = ymin,
+      ymax = ymax,
+      fill = Eggs
+    ),
+    inherit.aes = FALSE,
+    colour = NA
+  ) +
+
+  geom_point(
+    data = dummy_points,
+    aes(x = x, y = Ypos),
+    alpha = 0
+  ) +
+
   scale_x_continuous(
     breaks = month_days,
     labels = month_labels,
     limits = c(0, 366),
     expand = c(0, 0)
   ) +
+
   scale_y_continuous(
-    breaks = y_order$Ypos,
-    labels = paste(y_order$Species, y_order$SeasonLabel, sep = " - "),
+    breaks = c(y_order$Ypos, bottom_y),
+    labels = c(
+      y_order$YLabel,
+      "All species pooled"
+    ),
     expand = expansion(add = 1)
   ) +
-  theme_minimal(base_size = 18) +  # 1.5x size (default base is 11–12)
+
+  scale_fill_manual(
+    values = egg_cols,
+    guide = "none"
+  ) +
+
+  theme_minimal(base_size = 18) +
   theme(
-    axis.title.x = element_blank(),  # remove x-axis title
-    axis.title.y = element_blank(),  # remove y-axis title
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
     axis.text.x = element_text(face = "bold", size = 15),
-    axis.text.y = element_text(size = 15),
+    axis.text.y = ggtext::element_markdown(size = 15),
+    axis.text.y.left = ggtext::element_markdown(size = 15),
     panel.grid.major.y = element_blank(),
     panel.grid.minor = element_blank()
   )
+
 
 # === 5. PIE CHART FUNCTION ===
 
@@ -153,87 +519,95 @@ make_pie_grob <- function(df_group, show_legend = FALSE) {
     geom_bar(stat = "identity", width = 1) +
     coord_polar("y") +
     scale_fill_manual(
-      values = c("gray70", "orange", "red"),
+      values = egg_cols,
       name = "Egg status"
     ) +
     theme_void() +
-    theme(legend.position = if (show_legend) "right" else "none")
+    theme(
+      legend.position = if (show_legend) "right" else "none"
+    )
 }
 
 radius_scale <- function(n) {
-  rescale(n, to = c(3, 7), from = range(spawn.3pie$n_total, na.rm = TRUE))
+  scales::rescale(
+    n,
+    to = c(3, 7),
+    from = range(spawn.3pie$n_total, na.rm = TRUE)
+  )
 }
+
 
 # === 6. DRAW PIE CHARTS ===
 
 group_ids <- spawn.3pie %>%
-  group_by(Species, SeasonLabel, Date) %>%
-  summarise(n_rows = n(), x_numeric = first(x_numeric), Ypos = first(Ypos),
-            n_total = first(n_total), .groups = "drop") %>%
-  filter(n_rows == 3)
+  dplyr::group_by(Species, SeasonLabel, Date) %>%
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    x_numeric = dplyr::first(x_numeric),
+    Ypos = dplyr::first(Ypos),
+    n_total = dplyr::first(n_total),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_rows == 3)
 
-# Collect grobs
-pie_grobs <- vector("list", length = nrow(group_ids))
-
-for (i in seq_len(nrow(group_ids))) {
-  group_data <- spawn.3pie %>%
-    filter(Species == group_ids$Species[i],
-           SeasonLabel == group_ids$SeasonLabel[i],
-           Date == group_ids$Date[i])
-
-  grob <- ggplotGrob(make_pie_grob(group_data))
-  xpos <- group_ids$x_numeric[i]
-  ypos <- group_ids$Ypos[i]
-  radius <- radius_scale(group_ids$n_total[i])
-
-  pie_grobs[[i]] <- annotation_custom(
-    grob,
-    xmin = xpos - radius, xmax = xpos + radius,
-    ymin = ypos - radius * 0.1, ymax = ypos + radius * 0.1
-  )
-}
-
-# Collect grobs
 pie_layers <- list()
 
 for (i in seq_len(nrow(group_ids))) {
+
   group_data <- spawn.3pie %>%
-    filter(Species == group_ids$Species[i],
-           SeasonLabel == group_ids$SeasonLabel[i],
-           Date == group_ids$Date[i])
+    dplyr::filter(
+      Species == group_ids$Species[i],
+      SeasonLabel == group_ids$SeasonLabel[i],
+      Date == group_ids$Date[i]
+    )
 
   grob <- ggplotGrob(make_pie_grob(group_data))
+
   xpos <- group_ids$x_numeric[i]
   ypos <- group_ids$Ypos[i]
   radius <- radius_scale(group_ids$n_total[i])
 
   pie_layers[[i]] <- annotation_custom(
     grob,
-    xmin = xpos - radius, xmax = xpos + radius,
-    ymin = ypos - radius * 0.1, ymax = ypos + radius * 0.1
+    xmin = xpos - radius,
+    xmax = xpos + radius,
+    ymin = ypos - radius * 0.1,
+    ymax = ypos + radius * 0.1
   )
 }
 
-# Add all grobs in one go
 for (layer in pie_layers) {
   plot_base <- plot_base + layer
 }
 
+
+# Safety override: force markdown rendering after all layers are added
+plot_base <- plot_base +
+  theme(
+    axis.text.y = ggtext::element_markdown(size = 15),
+    axis.text.y.left = ggtext::element_markdown(size = 15)
+  )
+
+
 # === 7. LEGENDS ===
 
-# Create dummy data for legend pies
-legend_data <- tibble(
-  Eggs = factor(c("No", "Immature", "Mature"),
-                levels = c("No", "Immature", "Mature")),
-  frac = c(1/3, 1/3, 1/3)
+# Egg status legend
+legend_data <- tibble::tibble(
+  Eggs = factor(
+    c("No", "Immature", "Mature"),
+    levels = c("No", "Immature", "Mature")
+  ),
+  frac = c(1 / 3, 1 / 3, 1 / 3)
 )
 
-# Extract the egg status legend grob
-egg_legend_grob <- get_legend(
+egg_legend_grob <- cowplot::get_legend(
   ggplot(legend_data, aes(x = "", y = frac, fill = Eggs)) +
     geom_bar(stat = "identity", width = 1) +
     coord_polar("y") +
-    scale_fill_manual(values = c("gray70", "orange", "red"), name = "Egg status") +
+    scale_fill_manual(
+      values = egg_cols,
+      name = "Egg status"
+    ) +
     theme_void() +
     theme(
       legend.position = "right",
@@ -244,54 +618,123 @@ egg_legend_grob <- get_legend(
     )
 )
 
-# Wrap egg legend for patchwork
-egg_legend_wrapped <- wrap_elements(egg_legend_grob)
+egg_legend_wrapped <- patchwork::wrap_elements(egg_legend_grob)
 
-# Prepare sampling effort legend
+
+# Sampling effort legend
 n_range <- range(spawn.3pie$n_total, na.rm = TRUE)
 n_small <- n_range[1]
 n_large <- n_range[2]
 
 make_scaled_pie_grob <- function(n_val) {
-  df <- tibble(
-    Eggs = factor(c("No", "Immature", "Mature"), levels = c("No", "Immature", "Mature")),
-    frac = c(1/3, 1/3, 1/3),
+  df <- tibble::tibble(
+    Eggs = factor(
+      c("No", "Immature", "Mature"),
+      levels = c("No", "Immature", "Mature")
+    ),
+    frac = c(1 / 3, 1 / 3, 1 / 3),
     n_total = n_val
   )
+
   ggplotGrob(make_pie_grob(df))
 }
 
 grob_small <- make_scaled_pie_grob(n_small)
 grob_large <- make_scaled_pie_grob(n_large)
 
-r_large <- 60
-r_small <- 30
+n_label <- function(n) {
+  paste0("n = ", n, ifelse(n == 1, " colony", " colonies"))
+}
 
-# Sampling effort legend figure
-size_legend_base <- ggplot() +
-  xlim(0, 30) + ylim(0, 31) +
-  theme_void() +
-  annotate("text", x = 3.8, y = 29.5, label = "Sampling effort", size = 5.2, fontface = "bold") +
+legend_large_width <- 0.045
+legend_panel_aspect <- 10
 
-  # Large pie
-  annotation_custom(grob_large,
-                    xmin = 0 - r_large, xmax = 0 + r_large,
-                    ymin = 16 - r_large * 0.1, ymax = 16 + r_large * 0.1) +
-  annotate("text", x = 2, y = 17, label = paste0("n = 20 colonies"), hjust = 0, size = 5) +
+legend_width <- function(n) {
+  legend_large_width * radius_scale(n) / radius_scale(n_large)
+}
 
-  # Small pie
-  annotation_custom(grob_small,
-                    xmin = 0 - r_small, xmax = 0 + r_small,
-                    ymin = 5 - r_small * 0.1, ymax = 5 + r_small * 0.1) +
-  annotate("text", x = 2, y = 6, label = paste0("n = ", n_small, " colonies"), hjust = 0, size = 5)
+legend_height <- function(n) {
+  legend_width(n) * legend_panel_aspect
+}
 
-# Wrap and shift upward
-sampling_legend_wrapped <- wrap_elements(size_legend_base) +
-  plot_layout() & theme(plot.margin = margin(-30, 0, 0, 0))
+w_large <- legend_width(n_large)
+h_large <- legend_height(n_large)
 
-# Combine legends in a single row
+w_small <- legend_width(n_small)
+h_small <- legend_height(n_small)
+
+title_y <- 0.90
+large_y <- 0.50
+small_y <- 0.20
+
+sampling_legend_wrapped <- cowplot::ggdraw() +
+
+  cowplot::draw_label(
+    "Sampling effort",
+    x = 0.02,
+    y = title_y,
+    hjust = 0,
+    vjust = 0.5,
+    fontface = "bold",
+    size = 15
+  ) +
+
+  cowplot::draw_grob(
+    grob_large,
+    x = 0.06 - w_large / 2,
+    y = large_y - h_large / 2,
+    width = w_large,
+    height = h_large
+  ) +
+  cowplot::draw_label(
+    n_label(n_large),
+    x = 0.14,
+    y = large_y,
+    hjust = 0,
+    vjust = 0.5,
+    size = 14
+  ) +
+
+  cowplot::draw_grob(
+    grob_small,
+    x = 0.06 - w_small / 2,
+    y = small_y - h_small / 2,
+    width = w_small,
+    height = h_small
+  ) +
+  cowplot::draw_label(
+    n_label(n_small),
+    x = 0.14,
+    y = small_y,
+    hjust = 0,
+    vjust = 0.5,
+    size = 14
+  ) +
+
+  annotate(
+    "segment",
+    x = 0.60,
+    xend = 0.60,
+    y = 0.28,
+    yend = 0.72,
+    linewidth = 0.45,
+    linetype = "dotted",
+    colour = "grey45",
+    alpha = 0.7
+  ) +
+  annotate(
+    "text",
+    x = 0.66,
+    y = 0.50,
+    label = "Full moon",
+    hjust = 0,
+    vjust = 0.5,
+    size = 5
+  )
+
 legend_row <- egg_legend_wrapped + sampling_legend_wrapped +
-  plot_layout(ncol = 2, widths = c(1, 1))
+  plot_layout(ncol = 2, widths = c(0.85, 1.65))
+
 
 # === 8. COMBINE AND SAVE ===
 
@@ -300,9 +743,15 @@ combined_plot <- legend_row / plot_base +
 
 print(combined_plot)
 
-ggsave("inferredSpawning_Species x Season x Eggs_scaledBySample_legendRight.tiff",
-       plot = combined_plot,
-       width = 35, height = 21, units = "cm", dpi = 600, compression = "lzw")
+ggsave(
+  "inferredSpawning_Species x Season x Eggs.tiff",
+  plot = combined_plot,
+  width = 35,
+  height = 25,
+  units = "cm",
+  dpi = 1200,
+  compression = "lzw"
+)
 
 
 ```
